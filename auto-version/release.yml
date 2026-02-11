@@ -1,0 +1,176 @@
+# Auto-Versioning + Changelog
+# Automatically bumps version and generates changelog based on conventional commits.
+#
+# Commit convention:
+#   feat: ...   → minor bump
+#   fix: ...    → patch bump
+#   feat!: ...  → major bump (breaking change)
+#   chore/docs/style/refactor: ... → no bump
+#
+# Features:
+# - Parses conventional commits since last tag
+# - Determines version bump automatically
+# - Updates package.json version
+# - Generates CHANGELOG.md entries
+# - Creates GitHub Release with notes
+# - No external dependencies (pure shell + Node.js)
+#
+# Usage: Copy to .github/workflows/release.yml
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Force version bump type (leave empty for auto-detect)'
+        required: false
+        type: choice
+        options:
+          - ''
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine version bump
+        id: bump
+        run: |
+          # Get the latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+          # If manually specified, use that
+          if [ -n "${{ inputs.bump }}" ]; then
+            echo "type=${{ inputs.bump }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Parse commits since last tag
+          COMMITS=$(git log ${LATEST_TAG}..HEAD --pretty=format:"%s" 2>/dev/null || git log --pretty=format:"%s")
+
+          BUMP="none"
+          while IFS= read -r msg; do
+            if echo "$msg" | grep -qE '^[a-z]+(\(.+\))?!:'; then
+              BUMP="major"
+              break
+            elif echo "$msg" | grep -qE '^feat(\(.+\))?:'; then
+              [ "$BUMP" != "major" ] && BUMP="minor"
+            elif echo "$msg" | grep -qE '^fix(\(.+\))?:'; then
+              [ "$BUMP" = "none" ] && BUMP="patch"
+            fi
+          done <<< "$COMMITS"
+
+          if [ "$BUMP" = "none" ]; then
+            echo "No version-bumping commits found. Defaulting to patch."
+            BUMP="patch"
+          fi
+
+          echo "type=$BUMP" >> $GITHUB_OUTPUT
+
+      - name: Bump version
+        id: version
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          case "${{ steps.bump.outputs.type }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+          # Update package.json
+          node -e "
+            const pkg = require('./package.json');
+            pkg.version = '${NEW_VERSION}';
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          echo "Bumped version: $CURRENT → $NEW_VERSION"
+
+      - name: Generate changelog entry
+        id: changelog
+        run: |
+          LATEST_TAG="${{ steps.bump.outputs.latest_tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          DATE=$(date +%Y-%m-%d)
+
+          # Generate release notes from commits
+          NOTES=""
+          FEATURES=""
+          FIXES=""
+          OTHER=""
+
+          while IFS= read -r msg; do
+            if echo "$msg" | grep -qE '^feat(\(.+\))?:'; then
+              CLEAN=$(echo "$msg" | sed 's/^feat\([^)]*\)\?: //')
+              FEATURES="${FEATURES}\n- ${CLEAN}"
+            elif echo "$msg" | grep -qE '^fix(\(.+\))?:'; then
+              CLEAN=$(echo "$msg" | sed 's/^fix\([^)]*\)\?: //')
+              FIXES="${FIXES}\n- ${CLEAN}"
+            elif echo "$msg" | grep -qE '^(docs|refactor|perf|test|chore)(\(.+\))?:'; then
+              CLEAN=$(echo "$msg" | sed 's/^[a-z]*\([^)]*\)\?: //')
+              OTHER="${OTHER}\n- ${CLEAN}"
+            fi
+          done <<< "$(git log ${LATEST_TAG}..HEAD --pretty=format:"%s" 2>/dev/null || git log --pretty=format:"%s")"
+
+          # Build changelog entry
+          ENTRY="## [${VERSION}] - ${DATE}\n"
+          [ -n "$FEATURES" ] && ENTRY="${ENTRY}\n### Features\n${FEATURES}\n"
+          [ -n "$FIXES" ] && ENTRY="${ENTRY}\n### Fixes\n${FIXES}\n"
+          [ -n "$OTHER" ] && ENTRY="${ENTRY}\n### Other\n${OTHER}\n"
+
+          # Prepend to CHANGELOG.md
+          if [ -f CHANGELOG.md ]; then
+            echo -e "${ENTRY}" | cat - CHANGELOG.md > CHANGELOG.tmp
+            mv CHANGELOG.tmp CHANGELOG.md
+          else
+            echo -e "# Changelog\n\n${ENTRY}" > CHANGELOG.md
+          fi
+
+          # Save release notes for GitHub release
+          echo -e "${ENTRY}" > /tmp/release-notes.md
+          echo "notes_file=/tmp/release-notes.md" >> $GITHUB_OUTPUT
+
+      - name: Commit and tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git add package.json CHANGELOG.md
+          git commit -m "chore: release v${VERSION}"
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin main --follow-tags
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file "${{ steps.changelog.outputs.notes_file }}"

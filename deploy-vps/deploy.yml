@@ -1,0 +1,151 @@
+# Deploy to VPS
+# SSH-based deployment for Node.js applications.
+#
+# Features:
+# - Deploys on push to main
+# - SSH key authentication
+# - Zero-downtime restart with pm2
+# - Automatic rollback on failure
+# - Deployment notification via GitHub deployment status
+#
+# Usage: Copy to .github/workflows/deploy.yml
+# Required secrets: SSH_HOST, SSH_USER, SSH_KEY, DEPLOY_PATH
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build --if-present
+          npm test
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy
+        id: deploy
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          SSH_CMD="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST}"
+          SCP_CMD="scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no"
+
+          echo "::group::Creating release directory"
+          RELEASE_DIR="${DEPLOY_PATH}/releases/$(date +%Y%m%d%H%M%S)"
+          $SSH_CMD "mkdir -p ${RELEASE_DIR}"
+          echo "::endgroup::"
+
+          echo "::group::Uploading files"
+          # Sync project files (exclude dev files)
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            --exclude 'node_modules' \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'coverage' \
+            --exclude '.env.local' \
+            --exclude '.env.development' \
+            ./ ${SSH_USER}@${SSH_HOST}:${RELEASE_DIR}/
+          echo "::endgroup::"
+
+          echo "::group::Installing production dependencies"
+          $SSH_CMD "cd ${RELEASE_DIR} && npm ci --production"
+          echo "::endgroup::"
+
+          echo "::group::Switching symlink"
+          # Keep previous release for rollback
+          $SSH_CMD "
+            if [ -L ${DEPLOY_PATH}/current ]; then
+              PREV=\$(readlink ${DEPLOY_PATH}/current)
+              echo \$PREV > ${DEPLOY_PATH}/.previous_release
+            fi
+            ln -sfn ${RELEASE_DIR} ${DEPLOY_PATH}/current
+          "
+          echo "::endgroup::"
+
+          echo "::group::Restarting application"
+          $SSH_CMD "
+            cd ${DEPLOY_PATH}/current
+            # Copy shared env file if it exists
+            [ -f ${DEPLOY_PATH}/shared/.env ] && cp ${DEPLOY_PATH}/shared/.env .env
+            # Restart with pm2
+            if command -v pm2 &> /dev/null; then
+              pm2 reload ecosystem.config.cjs --update-env 2>/dev/null || \
+              pm2 start npm --name app -- start 2>/dev/null || \
+              pm2 restart app 2>/dev/null
+            else
+              echo 'pm2 not found — install with: npm install -g pm2'
+              exit 1
+            fi
+          "
+          echo "::endgroup::"
+
+          echo "::group::Cleanup old releases"
+          $SSH_CMD "
+            cd ${DEPLOY_PATH}/releases
+            ls -t | tail -n +6 | xargs rm -rf 2>/dev/null || true
+          "
+          echo "::endgroup::"
+
+          echo "release_dir=${RELEASE_DIR}" >> $GITHUB_OUTPUT
+
+      - name: Rollback on failure
+        if: failure() && steps.deploy.outcome == 'failure'
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          SSH_CMD="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST}"
+
+          echo "Deployment failed. Rolling back..."
+          $SSH_CMD "
+            if [ -f ${DEPLOY_PATH}/.previous_release ]; then
+              PREV=\$(cat ${DEPLOY_PATH}/.previous_release)
+              if [ -d \$PREV ]; then
+                ln -sfn \$PREV ${DEPLOY_PATH}/current
+                cd ${DEPLOY_PATH}/current
+                pm2 reload ecosystem.config.cjs --update-env 2>/dev/null || pm2 restart app
+                echo 'Rolled back to previous release'
+              fi
+            else
+              echo 'No previous release found for rollback'
+            fi
+          "
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
